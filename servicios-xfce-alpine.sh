@@ -82,7 +82,7 @@ setup_applets() {
 GPU_VENDOR=""
 
 detect_hardware() {
-    log_info "== Detectando hardware =="
+    log_info "== Detectando hardware (GPU) =="
     command -v lspci >/dev/null 2>&1 || install_pkg "pciutils"
 
     if ! command -v lspci >/dev/null 2>&1; then
@@ -165,19 +165,139 @@ install_drivers() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 6: Idioma español para el sistema y XFCE
+# BLOQUE 6: Detección de CPU y microcódigo
 # ------------------------------------------------------------------------------
-# NOTA: musl no tiene locale "es_MX.UTF-8"; se usa "es_ES.UTF-8", que es
-# funcionalmente idéntico para la traducción de interfaz (gettext no separa
-# variantes regionales de español en estos proyectos).
-#
-# NOTA 2: en vez de adivinar nombres de paquetes "-lang" uno por uno, se usa
-# el metapaquete oficial "lang". Cada paquete con traducciones tiene una
-# regla install_if que lo activa automáticamente cuando "lang" Y el propio
-# paquete base ya están instalados — así apk resuelve por sí solo qué
-# "-lang" corresponden a lo que ya tienes en el sistema (XFCE, thunar,
-# network-manager-applet, gtk, etc.), sin listas hardcodeadas que puedan
-# quedar desactualizadas o mal escritas.
+# NOTA IMPORTANTE: "amd-ucode" NO existe como paquete independiente en
+# Alpine (a diferencia de Arch/Debian). Para AMD, el microcódigo viaja
+# dentro de los paquetes "linux-firmware-amd*" (ya instalados parcialmente
+# si detectamos GPU AMD en el Bloque 5). Además: instalar el paquete de
+# microcódigo NO garantiza que se cargue en el arranque — Alpine no lo
+# integra automáticamente en el initramfs como otras distros; requeriría
+# pasos adicionales de mkinitfs/bootloader que quedan fuera del alcance
+# de este script. Se deja instalado como base y se advierte del límite.
+CPU_VENDOR=""
+
+detect_cpu() {
+    log_info "== Detectando fabricante de CPU =="
+    if grep -qi "GenuineIntel" /proc/cpuinfo 2>/dev/null; then
+        CPU_VENDOR="intel"
+    elif grep -qi "AuthenticAMD" /proc/cpuinfo 2>/dev/null; then
+        CPU_VENDOR="amd"
+    else
+        CPU_VENDOR="desconocido"
+    fi
+    log_ok "CPU clasificada como: $CPU_VENDOR"
+}
+
+install_microcode() {
+    log_info "== Instalando microcódigo de CPU =="
+    case "$CPU_VENDOR" in
+        intel)
+            install_pkg "intel-ucode"
+            ;;
+        amd)
+            install_pkg "linux-firmware-amd"
+            log_info "AMD no tiene paquete 'amd-ucode' en Alpine; el microcódigo viene en linux-firmware-amd*."
+            ;;
+        *)
+            log_warn "Fabricante de CPU no identificado. Se omite instalación de microcódigo."
+            ;;
+    esac
+    log_warn "El microcódigo queda instalado pero puede requerir integración manual con mkinitfs/bootloader para cargarse en el arranque. Verifica con: dmesg | grep -i microcode"
+}
+
+# ------------------------------------------------------------------------------
+# BLOQUE 7: zram (memoria comprimida al 100% de la RAM física)
+# ------------------------------------------------------------------------------
+setup_zram() {
+    log_info "== Configurando zram =="
+    install_pkg "zram-init"
+    install_pkg "zram-init-openrc"
+
+    ram_total_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+    ram_total_mb=$((ram_total_kb / 1024))
+
+    log_info "RAM física detectada: ${ram_total_mb}MB. Configurando zram al 100% de ese valor."
+
+    cat > /etc/conf.d/zram-init <<EOF
+load_on_start=yes
+unload_on_stop=yes
+num_devices=1
+type0=swap
+size0=${ram_total_mb}
+algo0=zstd
+EOF
+
+    # Ajustes de sysctl recomendados oficialmente para uso de zram como swap
+    if ! grep -q "^vm.swappiness=100" /etc/sysctl.conf 2>/dev/null; then
+        {
+            echo "vm.swappiness=100"
+            echo "vm.page-cluster=0"
+        } >> /etc/sysctl.conf
+    fi
+
+    rc-update add zram-init default || log_warn "No se pudo agregar 'zram-init' al runlevel default."
+
+    log_ok "zram configurado (swap comprimido = 100% de la RAM, algoritmo zstd)."
+    log_info "Verifica el algoritmo soportado tras reiniciar con: cat /sys/block/zram0/comp_algorithm"
+}
+
+# ------------------------------------------------------------------------------
+# BLOQUE 8: EarlyOOM (prevención de congelamientos por falta de memoria)
+# ------------------------------------------------------------------------------
+setup_earlyoom() {
+    log_info "== Configurando EarlyOOM =="
+    install_pkg "earlyoom"
+    install_pkg "earlyoom-openrc"
+
+    rc-update add earlyoom default || log_warn "No se pudo agregar 'earlyoom' al runlevel default."
+
+    log_ok "EarlyOOM configurado. Monitoreará la memoria y cerrará procesos antes de que el sistema se congele."
+}
+
+# ------------------------------------------------------------------------------
+# BLOQUE 9: Gestión de energía básica (ACPI, útil en laptops)
+# ------------------------------------------------------------------------------
+setup_power() {
+    log_info "== Configurando gestión de energía (ACPI) =="
+    install_pkg "acpid"
+    install_pkg "acpid-openrc"
+
+    rc-update add acpid default || log_warn "No se pudo agregar 'acpid' al runlevel default."
+
+    log_ok "acpid configurado. Gestionará eventos físicos (tapa, botón de encendido, etc.)."
+}
+
+# ------------------------------------------------------------------------------
+# BLOQUE 10: Soporte de impresión (CUPS)
+# ------------------------------------------------------------------------------
+setup_printing() {
+    log_info "== Configurando soporte de impresión (CUPS) =="
+    install_pkg "cups"
+    install_pkg "cups-openrc"
+    install_pkg "cups-filters"
+    install_pkg "system-config-printer"
+
+    rc-update add cupsd default || log_warn "No se pudo agregar 'cupsd' al runlevel default."
+
+    log_ok "CUPS configurado. Interfaz web disponible en http://localhost:631"
+}
+
+# ------------------------------------------------------------------------------
+# BLOQUE 11: Backends de compresión (ZIP/RAR/7z) para xarchiver
+# ------------------------------------------------------------------------------
+install_archive_tools() {
+    log_info "== Instalando utilidades de compresión (backends para xarchiver) =="
+    install_pkg "zip"
+    install_pkg "unzip"
+    install_pkg "p7zip"
+    install_pkg "unrar"   # freeware, licencia restrictiva de RARLAB (no libre, pero redistribuible)
+    log_ok "Backends de compresión instalados."
+}
+
+# ------------------------------------------------------------------------------
+# BLOQUE 12: Idioma español para el sistema y XFCE
+# ------------------------------------------------------------------------------
 setup_locale_es() {
     log_info "== Configurando idioma español para el sistema y XFCE =="
 
@@ -197,8 +317,6 @@ EOF
     chmod +x /etc/profile.d/lang-es.sh
     log_ok "Variables de idioma escritas en /etc/profile.d/lang-es.sh"
 
-    # Dispara automáticamente todos los "-lang" de paquetes ya instalados
-    # (XFCE, GTK, NetworkManager applet, etc.) vía la regla install_if de apk.
     log_info "Instalando traducciones para todo el software ya presente en el sistema..."
     install_pkg "lang"
 
@@ -206,22 +324,19 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 7: Tipografías base (antes de LibreOffice)
+# BLOQUE 13: Tipografías base (antes de LibreOffice)
 # ------------------------------------------------------------------------------
-# font-liberation es el nombre vigente (ttf-liberation quedó como alias
-# "deprecated" que solo reenvía a este). Se usa el actual para no depender
-# de un paquete de transición.
 install_fonts() {
     log_info "== Instalando tipografías base =="
     install_pkg "ttf-dejavu"
-    install_pkg "font-liberation"          # Métricamente compatible con Arial/Times/Courier — clave para .docx
+    install_pkg "font-liberation"
     install_pkg "font-liberation-sans-narrow"
     install_pkg "font-noto"
     log_ok "Tipografías base instaladas."
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 8: LibreOffice + paquete de idioma español
+# BLOQUE 14: LibreOffice + paquete de idioma español
 # ------------------------------------------------------------------------------
 install_libreoffice() {
     log_info "== Instalando LibreOffice (español) =="
@@ -231,13 +346,11 @@ install_libreoffice() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 9: Flatpak + Flathub (OnlyOffice y Google Chrome, opcionales)
+# BLOQUE 15: Flatpak + Flathub (OnlyOffice y Google Chrome, opcionales)
 # ------------------------------------------------------------------------------
 setup_flatpak() {
     log_info "== Configurando Flatpak y repositorio Flathub =="
 
-    # 'dbus' (no 'dbus-x11') trae 'dbus-run-session', suficiente para dar
-    # un bus de sesión desechable a un comando puntual sin depender de X11.
     install_pkg "dbus"
     install_pkg "flatpak"
     install_pkg "xdg-desktop-portal"
@@ -248,9 +361,6 @@ setup_flatpak() {
         return 0
     fi
 
-    # Si se ejecuta desde una TTY pura (sin sesión gráfica aún iniciada),
-    # flatpak puede advertir que no encuentra el bus de sesión D-Bus.
-    # dbus-run-session le da uno temporal solo para este comando.
     if command -v dbus-run-session >/dev/null 2>&1; then
         remote_add_cmd="dbus-run-session -- flatpak"
     else
@@ -275,8 +385,6 @@ setup_flatpak() {
         log_info "Se omite la instalación de OnlyOffice."
     fi
 
-    # 'com.google.Chrome' en Flathub es un wrapper mantenido por la
-    # comunidad, no publicado ni verificado directamente por Google.
     if ask_yes_no "¿Deseas instalar Google Chrome vía Flatpak (paquete comunitario, no oficial de Google)?"; then
         if $remote_add_cmd install -y flathub com.google.Chrome; then
             log_ok "Google Chrome instalado vía Flatpak."
@@ -291,37 +399,33 @@ setup_flatpak() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 10: Permisos de grupo para Audio/Video (usuario real vía doas)
+# BLOQUE 16: Permisos de grupo para Audio/Video/Impresión (usuario vía doas)
 # ------------------------------------------------------------------------------
 setup_user_groups() {
-    log_info "== Configurando permisos de grupo (audio/video) =="
+    log_info "== Configurando permisos de grupo (audio/video/lpadmin) =="
 
     target_user="${DOAS_USER:-}"
     [ -z "$target_user" ] && target_user="$(logname 2>/dev/null || true)"
 
     if [ -z "$target_user" ] || [ "$target_user" = "root" ]; then
         log_warn "No se pudo determinar un usuario estándar vía doas ni logname."
-        log_warn "Ejecuta manualmente: adduser <tu_usuario> audio && adduser <tu_usuario> video"
+        log_warn "Ejecuta manualmente: adduser <tu_usuario> audio video lpadmin"
         return 0
     fi
 
     log_info "Usuario detectado: $target_user"
 
-    if adduser "$target_user" audio; then
-        log_ok "Usuario '$target_user' agregado al grupo 'audio'."
-    else
-        log_warn "No se pudo agregar '$target_user' al grupo 'audio' (¿ya pertenecía?)."
-    fi
-
-    if adduser "$target_user" video; then
-        log_ok "Usuario '$target_user' agregado al grupo 'video'."
-    else
-        log_warn "No se pudo agregar '$target_user' al grupo 'video' (¿ya pertenecía?)."
-    fi
+    for grp in audio video lpadmin; do
+        if adduser "$target_user" "$grp"; then
+            log_ok "Usuario '$target_user' agregado al grupo '$grp'."
+        else
+            log_warn "No se pudo agregar '$target_user' al grupo '$grp' (¿ya pertenecía o el grupo no existe aún?)."
+        fi
+    done
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 11: Función principal
+# BLOQUE 17: Función principal
 # ------------------------------------------------------------------------------
 main() {
     log_info "===== Iniciando configuración post-instalación de XFCE en Alpine Linux ====="
@@ -331,6 +435,13 @@ main() {
     setup_applets
     detect_hardware
     install_drivers
+    detect_cpu
+    install_microcode
+    setup_zram
+    setup_earlyoom
+    setup_power
+    setup_printing
+    install_archive_tools
     setup_locale_es
     install_fonts
     install_libreoffice
@@ -338,7 +449,7 @@ main() {
     setup_user_groups
 
     log_ok "===== Proceso completado exitosamente ====="
-    log_info "Recuerda cerrar sesión (o reiniciar) para que el idioma, los grupos y los drivers surtan efecto."
+    log_info "Reinicia el sistema para que zram, earlyoom, acpid, cups, el idioma y el microcódigo surtan efecto por completo."
 
     trap - EXIT INT TERM
 }

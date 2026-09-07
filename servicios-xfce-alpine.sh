@@ -80,6 +80,7 @@ setup_applets() {
 # BLOQUE 4: Detección de hardware (GPU)
 # ------------------------------------------------------------------------------
 GPU_VENDOR=""
+vga_line=""
 
 detect_hardware() {
     log_info "== Detectando hardware (GPU) =="
@@ -120,8 +121,19 @@ detect_hardware() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 5: Firmware y controladores de video
+# BLOQUE 5: Firmware y controladores de video (con protección NVIDIA Legacy)
 # ------------------------------------------------------------------------------
+# NOTA: para tarjetas NVIDIA muy antiguas (Tesla/Fermi/Kepler) sin gráfica
+# integrada de respaldo, la aceleración 3D de nouveau puede colgar el
+# sistema o dejar pantalla negra. "NoAccel" es una opción real y
+# documentada del driver xf86-video-nouveau (ver man nouveau(4)) que
+# fuerza software rendering, sacrificando 3D pero garantizando video
+# estable a resolución nativa (a diferencia de vesa, que no usa KMS).
+# Si el hardware persiste con cuelgues incluso en consola de texto
+# (antes de que arranque Xorg), el siguiente paso sería el parámetro de
+# kernel "nouveau.noaccel=1" en la línea de arranque — no se aplica aquí
+# porque actúa a un nivel distinto (kernel vs. Xorg) y afecta también la
+# consola; se documenta como referencia si este fix no fuera suficiente.
 install_drivers() {
     log_info "== Instalando firmware y controladores =="
 
@@ -134,7 +146,37 @@ install_drivers() {
         nvidia)
             log_info "Instalando soporte NVIDIA (driver abierto Nouveau, vía Gallium)..."
             install_pkg "linux-firmware-nvidia"
-            log_warn "Nouveau se usa por compatibilidad con musl libc; para el driver propietario revisa 'testing' o 'nvidia-open'."
+
+            # Contamos cuántas tarjetas de video existen físicamente.
+            # Reutilizamos $vga_line del Bloque 4, pero contamos líneas
+            # por si hubiera más de un adaptador (ej. Optimus Intel+NVIDIA).
+            gpu_count="$(lspci | grep -cEi 'VGA compatible controller|3D controller' || true)"
+
+            if [ "$gpu_count" -eq 1 ]; then
+                log_warn "Se detectó NVIDIA como única tarjeta gráfica (sin gráfica integrada de respaldo)."
+                log_warn "En tarjetas NVIDIA antiguas (Legacy), Nouveau puede causar pantalla negra o cuelgues al iniciar Xorg."
+
+                if ask_yes_no "¿Es hardware Legacy o deseas deshabilitar la aceleración por hardware para garantizar que inicie el video?"; then
+                    log_info "Aplicando configuración segura (Failsafe) para Xorg..."
+
+                    install_pkg "xf86-video-nouveau"
+
+                    mkdir -p /etc/X11/xorg.conf.d
+                    cat > /etc/X11/xorg.conf.d/20-nouveau-safe.conf <<EOF
+Section "Device"
+    Identifier "Nvidia Legacy Failsafe"
+    Driver "nouveau"
+    Option "NoAccel" "True"
+EndSection
+EOF
+                    log_ok "Protección aplicada: /etc/X11/xorg.conf.d/20-nouveau-safe.conf (Aceleración 3D deshabilitada)."
+                    log_info "Si persisten cuelgues incluso en consola de texto, considera además el parámetro de kernel 'nouveau.noaccel=1'."
+                else
+                    log_info "Se mantiene la configuración por defecto de Nouveau."
+                fi
+            else
+                log_warn "Nouveau se usa por compatibilidad con musl libc. (Se detectaron $gpu_count GPUs)."
+            fi
             ;;
         amd)
             log_info "Instalando firmware y Vulkan para AMD/Radeon..."
@@ -167,14 +209,6 @@ install_drivers() {
 # ------------------------------------------------------------------------------
 # BLOQUE 6: Detección de CPU y microcódigo
 # ------------------------------------------------------------------------------
-# NOTA IMPORTANTE: "amd-ucode" NO existe como paquete independiente en
-# Alpine (a diferencia de Arch/Debian). Para AMD, el microcódigo viaja
-# dentro de los paquetes "linux-firmware-amd*" (ya instalados parcialmente
-# si detectamos GPU AMD en el Bloque 5). Además: instalar el paquete de
-# microcódigo NO garantiza que se cargue en el arranque — Alpine no lo
-# integra automáticamente en el initramfs como otras distros; requeriría
-# pasos adicionales de mkinitfs/bootloader que quedan fuera del alcance
-# de este script. Se deja instalado como base y se advierte del límite.
 CPU_VENDOR=""
 
 detect_cpu() {
@@ -203,7 +237,7 @@ install_microcode() {
             log_warn "Fabricante de CPU no identificado. Se omite instalación de microcódigo."
             ;;
     esac
-    log_warn "El microcódigo queda instalado pero puede requerir integración manual con mkinitfs/bootloader para cargarse en el arranque. Verifica con: dmesg | grep -i microcode"
+    log_warn "El microcódigo queda instalado pero puede requerir integración manual con mkinitfs/bootloader. Verifica con: dmesg | grep -i microcode"
 }
 
 # ------------------------------------------------------------------------------
@@ -228,7 +262,6 @@ size0=${ram_total_mb}
 algo0=zstd
 EOF
 
-    # Ajustes de sysctl recomendados oficialmente para uso de zram como swap
     if ! grep -q "^vm.swappiness=100" /etc/sysctl.conf 2>/dev/null; then
         {
             echo "vm.swappiness=100"
@@ -239,7 +272,6 @@ EOF
     rc-update add zram-init default || log_warn "No se pudo agregar 'zram-init' al runlevel default."
 
     log_ok "zram configurado (swap comprimido = 100% de la RAM, algoritmo zstd)."
-    log_info "Verifica el algoritmo soportado tras reiniciar con: cat /sys/block/zram0/comp_algorithm"
 }
 
 # ------------------------------------------------------------------------------
@@ -252,7 +284,7 @@ setup_earlyoom() {
 
     rc-update add earlyoom default || log_warn "No se pudo agregar 'earlyoom' al runlevel default."
 
-    log_ok "EarlyOOM configurado. Monitoreará la memoria y cerrará procesos antes de que el sistema se congele."
+    log_ok "EarlyOOM configurado."
 }
 
 # ------------------------------------------------------------------------------
@@ -265,7 +297,7 @@ setup_power() {
 
     rc-update add acpid default || log_warn "No se pudo agregar 'acpid' al runlevel default."
 
-    log_ok "acpid configurado. Gestionará eventos físicos (tapa, botón de encendido, etc.)."
+    log_ok "acpid configurado."
 }
 
 # ------------------------------------------------------------------------------
@@ -287,11 +319,11 @@ setup_printing() {
 # BLOQUE 11: Backends de compresión (ZIP/RAR/7z) para xarchiver
 # ------------------------------------------------------------------------------
 install_archive_tools() {
-    log_info "== Instalando utilidades de compresión (backends para xarchiver) =="
+    log_info "== Instalando utilidades de compresión =="
     install_pkg "zip"
     install_pkg "unzip"
     install_pkg "p7zip"
-    install_pkg "unrar"   # freeware, licencia restrictiva de RARLAB (no libre, pero redistribuible)
+    install_pkg "unrar"
     log_ok "Backends de compresión instalados."
 }
 
@@ -309,18 +341,15 @@ setup_locale_es() {
     fi
 
     cat > /etc/profile.d/lang-es.sh <<'EOF'
-# Configuración de idioma español (Latinoamérica) - generado por script post-install
 export LANG="es_ES.UTF-8"
 export LC_ALL="es_ES.UTF-8"
 export LC_MESSAGES="es_ES.UTF-8"
 EOF
     chmod +x /etc/profile.d/lang-es.sh
-    log_ok "Variables de idioma escritas en /etc/profile.d/lang-es.sh"
 
-    log_info "Instalando traducciones para todo el software ya presente en el sistema..."
     install_pkg "lang"
 
-    log_ok "Idioma español configurado. Aplica los cambios cerrando sesión (o reiniciando)."
+    log_ok "Idioma español configurado."
 }
 
 # ------------------------------------------------------------------------------
@@ -357,70 +386,55 @@ setup_flatpak() {
     install_pkg "xdg-desktop-portal-gtk"
 
     if ! command -v flatpak >/dev/null 2>&1; then
-        log_error "flatpak no quedó instalado. Verifica que el repositorio 'community' esté habilitado en /etc/apk/repositories. Se omite esta sección."
+        log_error "flatpak no quedó instalado. Verifica el repositorio 'community'. Se omite esta sección."
         return 0
     fi
 
     if command -v dbus-run-session >/dev/null 2>&1; then
         remote_add_cmd="dbus-run-session -- flatpak"
     else
-        log_warn "'dbus-run-session' no disponible; se ejecuta flatpak sin bus de sesión (puede mostrar un warning inofensivo)."
+        log_warn "'dbus-run-session' no disponible; se ejecuta flatpak sin bus de sesión."
         remote_add_cmd="flatpak"
     fi
 
     if $remote_add_cmd remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo; then
         log_ok "Repositorio Flathub agregado (o ya existía)."
     else
-        log_warn "No se pudo agregar el repositorio Flathub. Revisa tu conexión a internet."
+        log_warn "No se pudo agregar el repositorio Flathub."
         return 0
     fi
 
     if ask_yes_no "¿Deseas instalar OnlyOffice Desktop Editors vía Flatpak?"; then
-        if $remote_add_cmd install -y flathub org.onlyoffice.desktopeditors; then
-            log_ok "OnlyOffice instalado vía Flatpak."
-        else
-            log_warn "Fallo al instalar OnlyOffice vía Flatpak."
-        fi
+        $remote_add_cmd install -y flathub org.onlyoffice.desktopeditors && log_ok "OnlyOffice instalado." || log_warn "Fallo al instalar OnlyOffice."
     else
-        log_info "Se omite la instalación de OnlyOffice."
+        log_info "Se omite OnlyOffice."
     fi
 
     if ask_yes_no "¿Deseas instalar Google Chrome vía Flatpak (paquete comunitario, no oficial de Google)?"; then
-        if $remote_add_cmd install -y flathub com.google.Chrome; then
-            log_ok "Google Chrome instalado vía Flatpak."
-        else
-            log_warn "Fallo al instalar Google Chrome vía Flatpak."
-        fi
+        $remote_add_cmd install -y flathub com.google.Chrome && log_ok "Google Chrome instalado." || log_warn "Fallo al instalar Google Chrome."
     else
-        log_info "Se omite la instalación de Google Chrome."
+        log_info "Se omite Google Chrome."
     fi
-
-    log_info "Los accesos directos de Flatpak aparecerán tras cerrar sesión y volver a entrar a XFCE."
 }
 
 # ------------------------------------------------------------------------------
 # BLOQUE 16: Permisos de grupo para Audio/Video/Impresión (usuario vía doas)
 # ------------------------------------------------------------------------------
 setup_user_groups() {
-    log_info "== Configurando permisos de grupo (audio/video/lpadmin) =="
+    log_info "== Configurando permisos de grupo =="
 
     target_user="${DOAS_USER:-}"
     [ -z "$target_user" ] && target_user="$(logname 2>/dev/null || true)"
 
     if [ -z "$target_user" ] || [ "$target_user" = "root" ]; then
-        log_warn "No se pudo determinar un usuario estándar vía doas ni logname."
-        log_warn "Ejecuta manualmente: adduser <tu_usuario> audio video lpadmin"
+        log_warn "No se pudo determinar un usuario estándar. Ejecuta manualmente: adduser <usuario> audio video lpadmin"
         return 0
     fi
 
     log_info "Usuario detectado: $target_user"
 
     for grp in audio video lpadmin; do
-        if adduser "$target_user" "$grp"; then
-            log_ok "Usuario '$target_user' agregado al grupo '$grp'."
-        else
-            log_warn "No se pudo agregar '$target_user' al grupo '$grp' (¿ya pertenecía o el grupo no existe aún?)."
-        fi
+        adduser "$target_user" "$grp" && log_ok "Agregado a '$grp'." || log_warn "No se pudo agregar a '$grp'."
     done
 }
 
@@ -449,7 +463,7 @@ main() {
     setup_user_groups
 
     log_ok "===== Proceso completado exitosamente ====="
-    log_info "Reinicia el sistema para que zram, earlyoom, acpid, cups, el idioma y el microcódigo surtan efecto por completo."
+    log_info "Reinicia el sistema para que todos los cambios surtan efecto."
 
     trap - EXIT INT TERM
 }

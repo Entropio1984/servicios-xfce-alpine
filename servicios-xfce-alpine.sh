@@ -1,12 +1,14 @@
 #!/bin/sh
 # ==============================================================================
-# Script de configuración post-instalación para entorno XFCE en Alpine Linux
+# Script de configuración post-instalación para entorno de escritorio en Alpine
 # Compatible con: ash (BusyBox) - shell por defecto de Alpine Linux
+# Detecta si el entorno instalado es XFCE, Plasma o ambos, y adapta applets
+# e idioma en consecuencia.
 # ==============================================================================
 
 set -eu
 
-LOG_FILE="/var/log/xfce-postinstall.log"
+LOG_FILE="/var/log/desktop-postinstall.log"
 
 log_info()  { printf '\033[1;34m[INFO]\033[0m  %s\n' "$1" | tee -a "$LOG_FILE"; }
 log_ok()    { printf '\033[1;32m[OK]\033[0m    %s\n' "$1" | tee -a "$LOG_FILE"; }
@@ -57,27 +59,63 @@ install_pkg() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 3: Applets de red y audio (Wi-Fi + Volumen) para XFCE
+# BLOQUE 3: Detección del entorno de escritorio instalado
 # ------------------------------------------------------------------------------
-setup_applets() {
-    log_info "== Configurando applets de red y audio para XFCE =="
+# No se puede leer $XDG_CURRENT_DESKTOP porque el script corre como root
+# fuera de una sesión gráfica. Se pregunta directamente a 'apk' qué
+# metapaquetes de escritorio están presentes.
+DE_XFCE="no"
+DE_PLASMA="no"
 
-    install_pkg "networkmanager"
-    install_pkg "network-manager-applet"
-    install_pkg "networkmanager-wifi"
-    install_pkg "wpa_supplicant"
+detect_desktop_environment() {
+    log_info "== Detectando entorno de escritorio instalado =="
 
-    install_pkg "pulseaudio"
-    install_pkg "pulseaudio-alsa"
-    install_pkg "xfce4-pulseaudio-plugin"
+    if apk info -e xfce4-session >/dev/null 2>&1; then
+        DE_XFCE="yes"
+        log_ok "XFCE detectado."
+    fi
 
-    rc-update add networkmanager default || log_warn "No se pudo agregar 'networkmanager' al runlevel default."
+    if apk info -e plasma-desktop-meta >/dev/null 2>&1 || apk info -e plasma-desktop >/dev/null 2>&1; then
+        DE_PLASMA="yes"
+        log_ok "KDE Plasma detectado."
+    fi
 
-    log_ok "Applets configurados. Audio y Wi-Fi serán gestionados dinámicamente por la sesión."
+    if [ "$DE_XFCE" = "no" ] && [ "$DE_PLASMA" = "no" ]; then
+        log_warn "No se detectó XFCE ni Plasma instalados. Los pasos específicos de escritorio se omitirán donde corresponda."
+    fi
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 4: Detección de hardware (GPU)
+# BLOQUE 4: Applets de red y audio (adaptados al entorno detectado)
+# ------------------------------------------------------------------------------
+setup_applets() {
+    log_info "== Configurando applets de red y audio =="
+
+    # El backend (NetworkManager, wpa_supplicant, PulseAudio) es necesario
+    # sin importar el entorno gráfico.
+    install_pkg "networkmanager"
+    install_pkg "networkmanager-wifi"
+    install_pkg "wpa_supplicant"
+    install_pkg "pulseaudio"
+    install_pkg "pulseaudio-alsa"
+
+    if [ "$DE_XFCE" = "yes" ]; then
+        log_info "Instalando applets nativos de XFCE (GTK)..."
+        install_pkg "network-manager-applet"
+        install_pkg "xfce4-pulseaudio-plugin"
+    fi
+
+    if [ "$DE_PLASMA" = "yes" ]; then
+        log_info "Plasma detectado: usará sus widgets nativos (plasma-nm / plasma-pa), ya incluidos en plasma-desktop-meta. No se instalan applets GTK."
+    fi
+
+    rc-update add networkmanager default || log_warn "No se pudo agregar 'networkmanager' al runlevel default."
+
+    log_ok "Applets configurados según el entorno detectado."
+}
+
+# ------------------------------------------------------------------------------
+# BLOQUE 5: Detección de hardware (GPU)
 # ------------------------------------------------------------------------------
 GPU_VENDOR=""
 vga_line=""
@@ -121,19 +159,8 @@ detect_hardware() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 5: Firmware y controladores de video (con protección NVIDIA Legacy)
+# BLOQUE 6: Firmware y controladores de video (con protección NVIDIA Legacy)
 # ------------------------------------------------------------------------------
-# NOTA: para tarjetas NVIDIA muy antiguas (Tesla/Fermi/Kepler) sin gráfica
-# integrada de respaldo, la aceleración 3D de nouveau puede colgar el
-# sistema o dejar pantalla negra. "NoAccel" es una opción real y
-# documentada del driver xf86-video-nouveau (ver man nouveau(4)) que
-# fuerza software rendering, sacrificando 3D pero garantizando video
-# estable a resolución nativa (a diferencia de vesa, que no usa KMS).
-# Si el hardware persiste con cuelgues incluso en consola de texto
-# (antes de que arranque Xorg), el siguiente paso sería el parámetro de
-# kernel "nouveau.noaccel=1" en la línea de arranque — no se aplica aquí
-# porque actúa a un nivel distinto (kernel vs. Xorg) y afecta también la
-# consola; se documenta como referencia si este fix no fuera suficiente.
 install_drivers() {
     log_info "== Instalando firmware y controladores =="
 
@@ -147,9 +174,6 @@ install_drivers() {
             log_info "Instalando soporte NVIDIA (driver abierto Nouveau, vía Gallium)..."
             install_pkg "linux-firmware-nvidia"
 
-            # Contamos cuántas tarjetas de video existen físicamente.
-            # Reutilizamos $vga_line del Bloque 4, pero contamos líneas
-            # por si hubiera más de un adaptador (ej. Optimus Intel+NVIDIA).
             gpu_count="$(lspci | grep -cEi 'VGA compatible controller|3D controller' || true)"
 
             if [ "$gpu_count" -eq 1 ]; then
@@ -158,9 +182,7 @@ install_drivers() {
 
                 if ask_yes_no "¿Es hardware Legacy o deseas deshabilitar la aceleración por hardware para garantizar que inicie el video?"; then
                     log_info "Aplicando configuración segura (Failsafe) para Xorg..."
-
                     install_pkg "xf86-video-nouveau"
-
                     mkdir -p /etc/X11/xorg.conf.d
                     cat > /etc/X11/xorg.conf.d/20-nouveau-safe.conf <<EOF
 Section "Device"
@@ -169,8 +191,7 @@ Section "Device"
     Option "NoAccel" "True"
 EndSection
 EOF
-                    log_ok "Protección aplicada: /etc/X11/xorg.conf.d/20-nouveau-safe.conf (Aceleración 3D deshabilitada)."
-                    log_info "Si persisten cuelgues incluso en consola de texto, considera además el parámetro de kernel 'nouveau.noaccel=1'."
+                    log_ok "Protección aplicada: /etc/X11/xorg.conf.d/20-nouveau-safe.conf"
                 else
                     log_info "Se mantiene la configuración por defecto de Nouveau."
                 fi
@@ -207,7 +228,7 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 6: Detección de CPU y microcódigo
+# BLOQUE 7: Detección de CPU y microcódigo
 # ------------------------------------------------------------------------------
 CPU_VENDOR=""
 
@@ -237,11 +258,11 @@ install_microcode() {
             log_warn "Fabricante de CPU no identificado. Se omite instalación de microcódigo."
             ;;
     esac
-    log_warn "El microcódigo queda instalado pero puede requerir integración manual con mkinitfs/bootloader. Verifica con: dmesg | grep -i microcode"
+    log_warn "Verifica que se cargó en el arranque con: dmesg | grep -i microcode"
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 7: zram (memoria comprimida al 100% de la RAM física)
+# BLOQUE 8: zram (memoria comprimida al 100% de la RAM física)
 # ------------------------------------------------------------------------------
 setup_zram() {
     log_info "== Configurando zram =="
@@ -275,33 +296,29 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 8: EarlyOOM (prevención de congelamientos por falta de memoria)
+# BLOQUE 9: EarlyOOM
 # ------------------------------------------------------------------------------
 setup_earlyoom() {
     log_info "== Configurando EarlyOOM =="
     install_pkg "earlyoom"
     install_pkg "earlyoom-openrc"
-
     rc-update add earlyoom default || log_warn "No se pudo agregar 'earlyoom' al runlevel default."
-
     log_ok "EarlyOOM configurado."
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 9: Gestión de energía básica (ACPI, útil en laptops)
+# BLOQUE 10: Gestión de energía básica (ACPI)
 # ------------------------------------------------------------------------------
 setup_power() {
     log_info "== Configurando gestión de energía (ACPI) =="
     install_pkg "acpid"
     install_pkg "acpid-openrc"
-
     rc-update add acpid default || log_warn "No se pudo agregar 'acpid' al runlevel default."
-
     log_ok "acpid configurado."
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 10: Soporte de impresión (CUPS)
+# BLOQUE 11: Soporte de impresión (CUPS)
 # ------------------------------------------------------------------------------
 setup_printing() {
     log_info "== Configurando soporte de impresión (CUPS) =="
@@ -309,14 +326,12 @@ setup_printing() {
     install_pkg "cups-openrc"
     install_pkg "cups-filters"
     install_pkg "system-config-printer"
-
     rc-update add cupsd default || log_warn "No se pudo agregar 'cupsd' al runlevel default."
-
     log_ok "CUPS configurado. Interfaz web disponible en http://localhost:631"
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 11: Backends de compresión (ZIP/RAR/7z) para xarchiver
+# BLOQUE 12: Backends de compresión
 # ------------------------------------------------------------------------------
 install_archive_tools() {
     log_info "== Instalando utilidades de compresión =="
@@ -328,10 +343,10 @@ install_archive_tools() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 12: Idioma español para el sistema y XFCE
+# BLOQUE 13: Idioma español (XFCE y/o Plasma, según lo detectado)
 # ------------------------------------------------------------------------------
 setup_locale_es() {
-    log_info "== Configurando idioma español para el sistema y XFCE =="
+    log_info "== Configurando idioma español para el sistema =="
 
     install_pkg "musl-locales"
     install_pkg "musl-locales-lang"
@@ -347,13 +362,21 @@ export LC_MESSAGES="es_ES.UTF-8"
 EOF
     chmod +x /etc/profile.d/lang-es.sh
 
+    # Dispara automáticamente los "-lang" de TODO lo ya instalado
+    # (XFCE, GTK, y también Plasma si está presente, vía install_if).
     install_pkg "lang"
 
-    log_ok "Idioma español configurado."
+    if [ "$DE_PLASMA" = "yes" ]; then
+        log_info "Reforzando traducciones específicas de Plasma..."
+        install_pkg "plasma-desktop-lang"
+        install_pkg "kdeplasma-addons-lang"
+    fi
+
+    log_ok "Idioma español configurado para el/los entorno(s) detectado(s)."
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 13: Tipografías base (antes de LibreOffice)
+# BLOQUE 14: Tipografías base (antes de LibreOffice)
 # ------------------------------------------------------------------------------
 install_fonts() {
     log_info "== Instalando tipografías base =="
@@ -365,7 +388,7 @@ install_fonts() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 14: LibreOffice + paquete de idioma español
+# BLOQUE 15: LibreOffice + paquete de idioma español
 # ------------------------------------------------------------------------------
 install_libreoffice() {
     log_info "== Instalando LibreOffice (español) =="
@@ -375,7 +398,7 @@ install_libreoffice() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 15: Flatpak + Flathub (OnlyOffice y Google Chrome, opcionales)
+# BLOQUE 16: Flatpak + Flathub (OnlyOffice y Google Chrome, opcionales)
 # ------------------------------------------------------------------------------
 setup_flatpak() {
     log_info "== Configurando Flatpak y repositorio Flathub =="
@@ -418,7 +441,7 @@ setup_flatpak() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 16: Permisos de grupo para Audio/Video/Impresión (usuario vía doas)
+# BLOQUE 17: Permisos de grupo para Audio/Video/Impresión (usuario vía doas)
 # ------------------------------------------------------------------------------
 setup_user_groups() {
     log_info "== Configurando permisos de grupo =="
@@ -439,13 +462,14 @@ setup_user_groups() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 17: Función principal
+# BLOQUE 18: Función principal
 # ------------------------------------------------------------------------------
 main() {
-    log_info "===== Iniciando configuración post-instalación de XFCE en Alpine Linux ====="
+    log_info "===== Iniciando configuración post-instalación de escritorio en Alpine Linux ====="
 
     check_root
     update_system
+    detect_desktop_environment
     setup_applets
     detect_hardware
     install_drivers

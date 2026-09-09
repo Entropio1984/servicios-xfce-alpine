@@ -59,12 +59,6 @@ install_pkg() {
 # ------------------------------------------------------------------------------
 # BLOQUE 3: Distribución de teclado a "latam" (consola + sesión gráfica)
 # ------------------------------------------------------------------------------
-# Cubre dos capas independientes:
-#   1. Consola de texto (TTY) -> servicio OpenRC "loadkmap"
-#   2. Sesión gráfica (Xorg, usada por XFCE y Plasma) -> XkbLayout
-# Pasar LAYOUT y VARIANT como argumentos evita el menú interactivo de
-# setup-keymap. El único prompt restante es la confirmación de OpenRC por
-# tocar un servicio del runlevel "boot", que se responde con 'yes |'.
 setup_keyboard_layout() {
     log_info "== Configurando distribución de teclado a 'latam' =="
 
@@ -78,8 +72,6 @@ setup_keyboard_layout() {
         log_warn "'setup-keymap' no disponible (paquete alpine-conf). Se omite la configuración de consola."
     fi
 
-    # La sesión gráfica no hereda el layout de la consola; hay que
-    # indicárselo a Xorg explícitamente para XFCE y Plasma.
     mkdir -p /etc/X11/xorg.conf.d
     cat > /etc/X11/xorg.conf.d/00-keyboard.conf <<'EOF'
 Section "InputClass"
@@ -116,7 +108,35 @@ detect_desktop_environment() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 5: Applets de red y audio (adaptados al entorno detectado)
+# BLOQUE 5: Detección del usuario real del sistema (vía doas/logname)
+# ------------------------------------------------------------------------------
+TARGET_USER=""
+TARGET_HOME=""
+
+detect_target_user() {
+    log_info "== Detectando usuario real del sistema =="
+
+    TARGET_USER="${DOAS_USER:-}"
+    [ -z "$TARGET_USER" ] && TARGET_USER="$(logname 2>/dev/null || true)"
+
+    if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
+        log_warn "No se pudo determinar un usuario estándar vía doas ni logname."
+        TARGET_USER=""
+        return 0
+    fi
+
+    TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)"
+    if [ -z "$TARGET_HOME" ] || [ ! -d "$TARGET_HOME" ]; then
+        log_warn "No se pudo determinar el directorio home de '$TARGET_USER'."
+        TARGET_HOME=""
+        return 0
+    fi
+
+    log_ok "Usuario detectado: $TARGET_USER (home: $TARGET_HOME)"
+}
+
+# ------------------------------------------------------------------------------
+# BLOQUE 6: Applets de red y audio (adaptados al entorno detectado)
 # ------------------------------------------------------------------------------
 setup_applets() {
     log_info "== Configurando applets de red y audio =="
@@ -143,18 +163,20 @@ setup_applets() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 6: Detección de hardware (GPU)
+# BLOQUE 7: Detección de hardware gráfico (soporta configuraciones híbridas)
 # ------------------------------------------------------------------------------
-GPU_VENDOR=""
-vga_line=""
+GPU_HAS_INTEL="no"
+GPU_HAS_AMD="no"
+GPU_HAS_NVIDIA="no"
+GPU_HAS_VIRTUAL="no"
+GPU_COUNT=0
 
 detect_hardware() {
-    log_info "== Detectando hardware (GPU) =="
+    log_info "== Detectando hardware gráfico =="
     command -v lspci >/dev/null 2>&1 || install_pkg "pciutils"
 
     if ! command -v lspci >/dev/null 2>&1; then
         log_error "No fue posible obtener 'lspci'. Se omitirá la detección automática de GPU."
-        GPU_VENDOR="desconocido"
         return 0
     fi
 
@@ -162,32 +184,26 @@ detect_hardware() {
     lspci | tee -a "$LOG_FILE"
 
     vga_line="$(lspci | grep -Ei 'VGA compatible controller|3D controller' || true)"
+    GPU_COUNT="$(lspci | grep -cEi 'VGA compatible controller|3D controller' || true)"
 
     if [ -z "$vga_line" ]; then
         log_warn "No se detectó ningún controlador de video vía lspci."
-        GPU_VENDOR="desconocido"
         return 0
     fi
 
-    log_info "Controlador de video encontrado: $vga_line"
+    log_info "Controlador(es) de video encontrado(s):"
+    log_info "$vga_line"
 
-    if echo "$vga_line" | grep -qi "nvidia"; then
-        GPU_VENDOR="nvidia"
-    elif echo "$vga_line" | grep -qi "amd\|ati\|radeon"; then
-        GPU_VENDOR="amd"
-    elif echo "$vga_line" | grep -qi "intel"; then
-        GPU_VENDOR="intel"
-    elif echo "$vga_line" | grep -qi "virtio\|vmware\|virtualbox\|qxl"; then
-        GPU_VENDOR="virtual"
-    else
-        GPU_VENDOR="desconocido"
-    fi
+    echo "$vga_line" | grep -qi "intel" && GPU_HAS_INTEL="yes"
+    echo "$vga_line" | grep -Eq "AMD|ATI|Radeon" && GPU_HAS_AMD="yes"
+    echo "$vga_line" | grep -qi "nvidia" && GPU_HAS_NVIDIA="yes"
+    echo "$vga_line" | grep -Eqi "virtio|vmware|virtualbox|qxl" && GPU_HAS_VIRTUAL="yes"
 
-    log_ok "GPU clasificada como: $GPU_VENDOR"
+    log_ok "Resumen GPU -> Intel:$GPU_HAS_INTEL AMD:$GPU_HAS_AMD NVIDIA:$GPU_HAS_NVIDIA Virtual:$GPU_HAS_VIRTUAL (adaptadores detectados: $GPU_COUNT)"
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 7: Firmware y controladores de video (con protección NVIDIA Legacy)
+# BLOQUE 8: Firmware y controladores de video (protección NVIDIA Legacy)
 # ------------------------------------------------------------------------------
 install_drivers() {
     log_info "== Instalando firmware y controladores =="
@@ -197,66 +213,79 @@ install_drivers() {
     install_pkg "mesa-gl"
     install_pkg "mesa-egl"
 
-    case "$GPU_VENDOR" in
-        nvidia)
-            log_info "Instalando soporte NVIDIA (driver abierto Nouveau, vía Gallium)..."
-            install_pkg "linux-firmware-nvidia"
+    if [ "$GPU_HAS_INTEL" = "yes" ]; then
+        log_info "Instalando firmware Intel..."
+        install_pkg "linux-firmware-i915"
+        install_pkg "mesa-vulkan-intel"
+    fi
 
-            gpu_count="$(lspci | grep -cEi 'VGA compatible controller|3D controller' || true)"
+    if [ "$GPU_HAS_AMD" = "yes" ]; then
+        log_info "Instalando firmware y Vulkan para AMD/Radeon..."
+        install_pkg "linux-firmware-amdgpu"
+        install_pkg "linux-firmware-radeon"
+        install_pkg "mesa-vulkan-ati"
+        install_pkg "mesa-vulkan-radeon"
+        install_pkg "vulkan-loader"
+    fi
 
-            if [ "$gpu_count" -eq 1 ]; then
-                log_warn "Se detectó NVIDIA como única tarjeta gráfica (sin gráfica integrada de respaldo)."
-                log_warn "En tarjetas NVIDIA antiguas (Legacy), Nouveau puede causar pantalla negra o cuelgues al iniciar Xorg."
+    if [ "$GPU_HAS_VIRTUAL" = "yes" ]; then
+        log_info "Entorno virtualizado detectado. Instalando utilidades QEMU/KVM/VirtualBox..."
+        install_pkg "xf86-video-vmware"
+        install_pkg "xf86-video-qxl"
+        install_pkg "spice-vdagent"
+        rc-update add spice-vdagentd default || log_warn "Fallo al habilitar spice-vdagentd."
+    fi
 
-                if ask_yes_no "¿Es hardware Legacy o deseas deshabilitar la aceleración por hardware para garantizar que inicie el video?"; then
-                    log_info "Aplicando configuración segura (Failsafe) para Xorg..."
-                    install_pkg "xf86-video-nouveau"
-                    mkdir -p /etc/X11/xorg.conf.d
-                    cat > /etc/X11/xorg.conf.d/20-nouveau-safe.conf <<EOF
+    if [ "$GPU_HAS_NVIDIA" = "yes" ]; then
+        log_info "Instalando soporte NVIDIA (driver abierto Nouveau, vía Gallium)..."
+        install_pkg "linux-firmware-nvidia"
+
+        if [ "$GPU_COUNT" -gt 1 ]; then
+            log_warn "Configuración híbrida detectada ($GPU_COUNT adaptadores, ej. Optimus)."
+            log_warn "Aunque exista una GPU integrada de respaldo, Xorg puede seguir intentando inicializar aceleración 3D sobre nouveau y colgar el arranque en tarjetas Fermi/Kepler antiguas."
+        else
+            log_warn "Se detectó NVIDIA como única tarjeta gráfica (sin gráfica integrada de respaldo)."
+        fi
+        log_warn "En tarjetas NVIDIA antiguas (Tesla/Fermi/Kepler), Nouveau puede causar pantalla negra o cuelgues al iniciar Xorg."
+
+        log_info "Opción 's': bloquea la NVIDIA por completo (kernel + Xorg) y usa solo la GPU restante. Modo seguro, recomendado en hardware Legacy."
+        log_info "Opción 'n': deja Nouveau activo con aceleración 3D normal en la NVIDIA. Riesgo de pantalla negra/cuelgue en tarjetas antiguas."
+
+        if ask_yes_no "¿Bloquear la NVIDIA y usar solo la GPU restante (modo seguro)?"; then
+            log_info "Aplicando protección: NoAccel en Xorg + bloqueo del módulo nouveau en el kernel..."
+
+            install_pkg "xf86-video-nouveau"
+            mkdir -p /etc/X11/xorg.conf.d
+            cat > /etc/X11/xorg.conf.d/20-nouveau-safe.conf <<EOF
 Section "Device"
     Identifier "Nvidia Legacy Failsafe"
     Driver "nouveau"
     Option "NoAccel" "True"
 EndSection
 EOF
-                    log_ok "Protección aplicada: /etc/X11/xorg.conf.d/20-nouveau-safe.conf"
-                else
-                    log_info "Se mantiene la configuración por defecto de Nouveau."
-                fi
-            else
-                log_warn "Nouveau se usa por compatibilidad con musl libc. (Se detectaron $gpu_count GPUs)."
-            fi
-            ;;
-        amd)
-            log_info "Instalando firmware y Vulkan para AMD/Radeon..."
-            install_pkg "linux-firmware-amdgpu"
-            install_pkg "linux-firmware-radeon"
-            install_pkg "mesa-vulkan-ati"
-            install_pkg "mesa-vulkan-radeon"
-            install_pkg "vulkan-loader"
-            ;;
-        intel)
-            log_info "Instalando firmware Intel..."
-            install_pkg "linux-firmware-i915"
-            install_pkg "mesa-vulkan-intel"
-            ;;
-        virtual)
-            log_info "Entorno virtualizado detectado. Instalando utilidades QEMU/KVM/VirtualBox..."
-            install_pkg "xf86-video-vmware"
-            install_pkg "xf86-video-qxl"
-            install_pkg "spice-vdagent"
-            rc-update add spice-vdagentd default || log_warn "Fallo al habilitar spice-vdagentd."
-            ;;
-        *)
-            log_warn "GPU no identificada. mesa-dri-gallium ya cubre software rendering (llvmpipe) de respaldo."
-            ;;
-    esac
+
+            mkdir -p /etc/modprobe.d
+            cat > /etc/modprobe.d/blacklist-nouveau.conf <<'EOF'
+blacklist nouveau
+options nouveau modeset=0
+EOF
+
+            log_ok "Protección aplicada: /etc/X11/xorg.conf.d/20-nouveau-safe.conf + /etc/modprobe.d/blacklist-nouveau.conf"
+            log_info "La NVIDIA quedará inactiva; el sistema usará solo la(s) GPU(s) restante(s). Para revertir: borra ambos archivos y reinicia."
+        else
+            log_info "Se mantiene Nouveau activo sin restricciones (NVIDIA con aceleración 3D normal)."
+        fi
+    fi
+
+    if [ "$GPU_HAS_INTEL" = "no" ] && [ "$GPU_HAS_AMD" = "no" ] && [ "$GPU_HAS_NVIDIA" = "no" ] && [ "$GPU_HAS_VIRTUAL" = "no" ]; then
+        log_warn "GPU no identificada. mesa-dri-gallium ya cubre software rendering (llvmpipe) de respaldo."
+    fi
 
     log_ok "Instalación de firmware y controladores finalizada."
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 8: Detección de CPU y microcódigo
+# BLOQUE 9: Detección de CPU y microcódigo
 # ------------------------------------------------------------------------------
 CPU_VENDOR=""
 
@@ -290,7 +319,7 @@ install_microcode() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 9: zram (memoria comprimida al 100% de la RAM física)
+# BLOQUE 10: zram (memoria comprimida al 100% de la RAM física)
 # ------------------------------------------------------------------------------
 setup_zram() {
     log_info "== Configurando zram =="
@@ -324,7 +353,7 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 10: EarlyOOM
+# BLOQUE 11: EarlyOOM
 # ------------------------------------------------------------------------------
 setup_earlyoom() {
     log_info "== Configurando EarlyOOM =="
@@ -335,7 +364,7 @@ setup_earlyoom() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 11: Gestión de energía básica (ACPI)
+# BLOQUE 12: Gestión de energía básica (ACPI)
 # ------------------------------------------------------------------------------
 setup_power() {
     log_info "== Configurando gestión de energía (ACPI) =="
@@ -346,7 +375,7 @@ setup_power() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 12: Soporte de impresión (CUPS)
+# BLOQUE 13: Soporte de impresión (CUPS)
 # ------------------------------------------------------------------------------
 setup_printing() {
     log_info "== Configurando soporte de impresión (CUPS) =="
@@ -359,19 +388,25 @@ setup_printing() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 13: Backends de compresión
+# BLOQUE 14: Backends de compresión
 # ------------------------------------------------------------------------------
+# NOTA: "unrar" NO existe como paquete en Alpine (ni en main ni en
+# community, verificado en v3.24) - es de licencia no-libre y Alpine no
+# lo empaqueta. No se automatiza su instalación manual porque cada
+# versión de rarlab.com cambia de nombre de archivo y una URL fija en
+# el script quedaría rota sin previo aviso.
 install_archive_tools() {
     log_info "== Instalando utilidades de compresión =="
     install_pkg "zip"
     install_pkg "unzip"
     install_pkg "p7zip"
-    install_pkg "unrar"
-    log_ok "Backends de compresión instalados."
+    log_warn "'unrar' no está disponible en los repos de Alpine (licencia no-libre)."
+    log_info "Para soporte de RAR, instala manualmente el binario oficial desde https://www.rarlab.com/download.htm"
+    log_ok "Backends de compresión instalados (zip/unzip/7z)."
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 14: Idioma español (XFCE y/o Plasma, según lo detectado)
+# BLOQUE 15: Idioma español — sistema, XFCE y propagación global a Plasma
 # ------------------------------------------------------------------------------
 setup_locale_es() {
     log_info "== Configurando idioma español para el sistema =="
@@ -389,6 +424,17 @@ export LC_ALL="es_ES.UTF-8"
 export LC_MESSAGES="es_ES.UTF-8"
 EOF
     chmod +x /etc/profile.d/lang-es.sh
+    log_ok "Capa 1/3: variables de idioma escritas en /etc/profile.d/lang-es.sh"
+
+    if [ -f /etc/environment ]; then
+        sed -i '/^LANG=/d;/^LC_ALL=/d;/^LC_MESSAGES=/d' /etc/environment
+    fi
+    {
+        echo "LANG=es_ES.UTF-8"
+        echo "LC_ALL=es_ES.UTF-8"
+        echo "LC_MESSAGES=es_ES.UTF-8"
+    } >> /etc/environment
+    log_ok "Capa 2/3: variables de idioma agregadas a /etc/environment (leído por PAM en la mayoría de gestores de sesión gráficos)."
 
     install_pkg "lang"
 
@@ -396,13 +442,38 @@ EOF
         log_info "Reforzando traducciones específicas de Plasma..."
         install_pkg "plasma-desktop-lang"
         install_pkg "kdeplasma-addons-lang"
+
+        mkdir -p /etc/xdg
+        cat > /etc/xdg/plasma-localerc <<'EOF'
+[Formats]
+LANG=es_ES.UTF-8
+
+[Translations]
+LANGUAGE=es_ES:es
+EOF
+        log_ok "Capa 3/3: default de sistema escrito en /etc/xdg/plasma-localerc (aplica a usuarios nuevos)."
+
+        if [ -n "$TARGET_USER" ] && [ -n "$TARGET_HOME" ]; then
+            mkdir -p "$TARGET_HOME/.config"
+            cat > "$TARGET_HOME/.config/plasma-localerc" <<'EOF'
+[Formats]
+LANG=es_ES.UTF-8
+
+[Translations]
+LANGUAGE=es_ES:es
+EOF
+            chown "$TARGET_USER":"$TARGET_USER" "$TARGET_HOME/.config/plasma-localerc" 2>/dev/null || true
+            log_ok "Capa 3/3: idioma de Plasma pre-configurado también para el usuario existente '$TARGET_USER'."
+        else
+            log_warn "No se detectó un usuario existente; solo quedó el default de sistema en /etc/xdg/plasma-localerc."
+        fi
     fi
 
     log_ok "Idioma español configurado para el/los entorno(s) detectado(s)."
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 15: Tipografías base (antes de LibreOffice)
+# BLOQUE 16: Tipografías base (antes de LibreOffice)
 # ------------------------------------------------------------------------------
 install_fonts() {
     log_info "== Instalando tipografías base =="
@@ -414,7 +485,7 @@ install_fonts() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 16: LibreOffice + paquete de idioma español
+# BLOQUE 17: LibreOffice + paquete de idioma español
 # ------------------------------------------------------------------------------
 install_libreoffice() {
     log_info "== Instalando LibreOffice (español) =="
@@ -424,7 +495,7 @@ install_libreoffice() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 17: Flatpak + Flathub (OnlyOffice y Google Chrome, opcionales)
+# BLOQUE 18: Flatpak + Flathub (OnlyOffice y Google Chrome, opcionales)
 # ------------------------------------------------------------------------------
 setup_flatpak() {
     log_info "== Configurando Flatpak y repositorio Flathub =="
@@ -467,28 +538,23 @@ setup_flatpak() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 18: Permisos de grupo para Audio/Video/Impresión (usuario vía doas)
+# BLOQUE 19: Permisos de grupo para Audio/Video/Impresión
 # ------------------------------------------------------------------------------
 setup_user_groups() {
     log_info "== Configurando permisos de grupo =="
 
-    target_user="${DOAS_USER:-}"
-    [ -z "$target_user" ] && target_user="$(logname 2>/dev/null || true)"
-
-    if [ -z "$target_user" ] || [ "$target_user" = "root" ]; then
-        log_warn "No se pudo determinar un usuario estándar. Ejecuta manualmente: adduser <usuario> audio video lpadmin"
+    if [ -z "$TARGET_USER" ]; then
+        log_warn "No se determinó un usuario estándar. Ejecuta manualmente: adduser <usuario> audio video lpadmin"
         return 0
     fi
 
-    log_info "Usuario detectado: $target_user"
-
     for grp in audio video lpadmin; do
-        adduser "$target_user" "$grp" && log_ok "Agregado a '$grp'." || log_warn "No se pudo agregar a '$grp'."
+        adduser "$TARGET_USER" "$grp" && log_ok "Agregado a '$grp'." || log_warn "No se pudo agregar a '$grp'."
     done
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 19: Función principal
+# BLOQUE 20: Función principal
 # ------------------------------------------------------------------------------
 main() {
     log_info "===== Iniciando configuración post-instalación de escritorio en Alpine Linux ====="
@@ -497,6 +563,7 @@ main() {
     update_system
     setup_keyboard_layout
     detect_desktop_environment
+    detect_target_user
     setup_applets
     detect_hardware
     install_drivers

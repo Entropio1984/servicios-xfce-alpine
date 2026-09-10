@@ -561,23 +561,40 @@ setup_flatpak() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 19: Permisos de grupo para Audio/Video/Impresión
+# BLOQUE 19: Automontaje de dispositivos USB
+# ------------------------------------------------------------------------------
+setup_automount() {
+    log_info "== Configurando automontaje de dispositivos USB =="
+    install_pkg "gvfs"
+    install_pkg "udisks2"
+    install_pkg "polkit"
+
+    if [ "$DE_XFCE" = "yes" ]; then
+        install_pkg "thunar-volman"
+    fi
+
+    rc-update add udisks2 default || log_warn "No se pudo agregar 'udisks2' al runlevel default."
+    log_ok "Soporte para automontaje USB configurado."
+}
+
+# ------------------------------------------------------------------------------
+# BLOQUE 20: Permisos de grupo para Audio/Video/Impresión/Dispositivos Extraíbles
 # ------------------------------------------------------------------------------
 setup_user_groups() {
     log_info "== Configurando permisos de grupo =="
 
     if [ -z "$TARGET_USER" ]; then
-        log_warn "No se determinó un usuario estándar. Ejecuta manualmente: adduser <usuario> audio video lpadmin"
+        log_warn "No se determinó un usuario estándar. Ejecuta manualmente: adduser <usuario> audio video lpadmin plugdev"
         return 0
     fi
 
-    for grp in audio video lpadmin; do
+    for grp in audio video lpadmin plugdev; do
         adduser "$TARGET_USER" "$grp" && log_ok "Agregado a '$grp'." || log_warn "No se pudo agregar a '$grp'."
     done
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 20: Función principal
+# BLOQUE 21: Función principal
 # ------------------------------------------------------------------------------
 main() {
     log_info "===== Iniciando configuración post-instalación de escritorio en Alpine Linux ====="
@@ -601,6 +618,7 @@ main() {
     install_fonts
     install_libreoffice
     setup_flatpak
+    setup_automount
     setup_user_groups
 
     log_ok "===== Proceso completado exitosamente ====="

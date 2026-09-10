@@ -84,26 +84,25 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 4: Detección del entorno de escritorio instalado
+# BLOQUE 4: Detección multiparadigma del entorno de escritorio
 # ------------------------------------------------------------------------------
 DE_XFCE="no"
 DE_PLASMA="no"
+DE_GNOME="no"
+DE_MATE="no"
+DE_LXQT="no"
 
 detect_desktop_environment() {
     log_info "== Detectando entorno de escritorio instalado =="
 
-    if apk info -e xfce4-session >/dev/null 2>&1; then
-        DE_XFCE="yes"
-        log_ok "XFCE detectado."
-    fi
+    apk info -e xfce4-session >/dev/null 2>&1 && { DE_XFCE="yes"; log_ok "XFCE detectado."; }
+    apk info -e plasma-desktop >/dev/null 2>&1 && { DE_PLASMA="yes"; log_ok "KDE Plasma detectado."; }
+    apk info -e gnome-shell >/dev/null 2>&1 && { DE_GNOME="yes"; log_ok "GNOME detectado."; }
+    apk info -e mate-session-manager >/dev/null 2>&1 && { DE_MATE="yes"; log_ok "MATE detectado."; }
+    apk info -e lxqt-session >/dev/null 2>&1 && { DE_LXQT="yes"; log_ok "LXQt detectado."; }
 
-    if apk info -e plasma-desktop-meta >/dev/null 2>&1 || apk info -e plasma-desktop >/dev/null 2>&1; then
-        DE_PLASMA="yes"
-        log_ok "KDE Plasma detectado."
-    fi
-
-    if [ "$DE_XFCE" = "no" ] && [ "$DE_PLASMA" = "no" ]; then
-        log_warn "No se detectó XFCE ni Plasma instalados."
+    if [ "$DE_XFCE" = "no" ] && [ "$DE_PLASMA" = "no" ] && [ "$DE_GNOME" = "no" ] && [ "$DE_MATE" = "no" ] && [ "$DE_LXQT" = "no" ]; then
+        log_warn "No se detectó un entorno soportado. Se instalarán herramientas genéricas de consola."
     fi
 }
 
@@ -136,30 +135,54 @@ detect_target_user() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 6: Applets de red y audio (adaptados al entorno detectado)
+# BLOQUE 6: Applets de red y audio (enrutamiento dinámico según DE)
 # ------------------------------------------------------------------------------
 setup_applets() {
-    log_info "== Configurando applets de red y audio =="
+    log_info "== Configurando servicios base de red y audio =="
 
+    # Base universal independiente de la interfaz gráfica
     install_pkg "networkmanager"
     install_pkg "networkmanager-wifi"
     install_pkg "wpa_supplicant"
     install_pkg "pulseaudio"
     install_pkg "pulseaudio-alsa"
 
+    log_info "Inyectando applets de interfaz específicos..."
+
     if [ "$DE_XFCE" = "yes" ]; then
-        log_info "Instalando applets nativos de XFCE (GTK)..."
         install_pkg "network-manager-applet"
         install_pkg "xfce4-pulseaudio-plugin"
     fi
 
     if [ "$DE_PLASMA" = "yes" ]; then
-        log_info "Plasma detectado: usará sus widgets nativos (plasma-nm / plasma-pa)."
+        install_pkg "plasma-nm"
+        install_pkg "plasma-pa"
     fi
 
+    if [ "$DE_GNOME" = "yes" ]; then
+        # GNOME tiene estos controles incrustados en su shell de forma monolítica.
+        # Instalamos pavucontrol como mezclador avanzado de respaldo.
+        install_pkg "pavucontrol"
+    fi
+
+    if [ "$DE_MATE" = "yes" ]; then
+        # MATE es altamente compatible con el ecosistema GTK de NM.
+        install_pkg "network-manager-applet"
+        install_pkg "mate-media"
+    fi
+
+    if [ "$DE_LXQT" = "yes" ]; then
+        # LXQt carece de un applet propio maduro para NM, nm-applet es el estándar de facto.
+        # Para audio, pavucontrol-qt es la herramienta oficial del proyecto.
+        install_pkg "network-manager-applet"
+        install_pkg "pavucontrol-qt"
+    fi
+
+    # NetworkManager asume el control absoluto de wpa_supplicant vía D-Bus.
+    # PulseAudio no se toca aquí: OpenRC no debe arrancar audio de sistema, cada DE lo hace en su autostart.
     rc-update add networkmanager default || log_warn "No se pudo agregar 'networkmanager' al runlevel default."
 
-    log_ok "Applets configurados según el entorno detectado."
+    log_ok "Arquitectura de red y audio acoplada al entorno visual."
 }
 
 # ------------------------------------------------------------------------------

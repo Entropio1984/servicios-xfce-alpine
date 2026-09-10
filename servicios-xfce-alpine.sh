@@ -96,7 +96,14 @@ detect_desktop_environment() {
     log_info "== Detectando entorno de escritorio instalado =="
 
     apk info -e xfce4-session >/dev/null 2>&1 && { DE_XFCE="yes"; log_ok "XFCE detectado."; }
+
+    # Se comprueban ambos nombres: plasma-desktop-meta (metapaquete usado
+    # por setup-desktop) y plasma-desktop (paquete real que trae como
+    # dependencia). Cubre también instalaciones manuales/no estándar que
+    # no pasaron por el metapaquete.
+    apk info -e plasma-desktop-meta >/dev/null 2>&1 && { DE_PLASMA="yes"; log_ok "KDE Plasma detectado."; }
     apk info -e plasma-desktop >/dev/null 2>&1 && { DE_PLASMA="yes"; log_ok "KDE Plasma detectado."; }
+
     apk info -e gnome-shell >/dev/null 2>&1 && { DE_GNOME="yes"; log_ok "GNOME detectado."; }
     apk info -e mate-session-manager >/dev/null 2>&1 && { DE_MATE="yes"; log_ok "MATE detectado."; }
     apk info -e lxqt-session >/dev/null 2>&1 && { DE_LXQT="yes"; log_ok "LXQt detectado."; }
@@ -140,7 +147,6 @@ detect_target_user() {
 setup_applets() {
     log_info "== Configurando servicios base de red y audio =="
 
-    # Base universal independiente de la interfaz gráfica
     install_pkg "networkmanager"
     install_pkg "networkmanager-wifi"
     install_pkg "wpa_supplicant"
@@ -172,14 +178,16 @@ setup_applets() {
     fi
 
     if [ "$DE_LXQT" = "yes" ]; then
-        # LXQt carece de un applet propio maduro para NM, nm-applet es el estándar de facto.
-        # Para audio, pavucontrol-qt es la herramienta oficial del proyecto.
+        # lxqt-panel YA trae su propio plugin de volumen en la bandeja (no
+        # requiere paquete aparte, solo activarlo desde la configuración
+        # del panel). nm-applet sigue siendo el estándar de facto para
+        # WiFi en LXQt, ya que no hay un applet nativo Qt tan extendido.
         install_pkg "network-manager-applet"
+        # pavucontrol-qt es un mezclador detallado complementario (igual
+        # que pavucontrol en GNOME), no el widget de bandeja en sí.
         install_pkg "pavucontrol-qt"
     fi
 
-    # NetworkManager asume el control absoluto de wpa_supplicant vía D-Bus.
-    # PulseAudio no se toca aquí: OpenRC no debe arrancar audio de sistema, cada DE lo hace en su autostart.
     rc-update add networkmanager default || log_warn "No se pudo agregar 'networkmanager' al runlevel default."
 
     log_ok "Arquitectura de red y audio acoplada al entorno visual."
@@ -398,7 +406,64 @@ setup_power() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 13: Soporte de impresión (CUPS)
+# BLOQUE 13: Montaje automático de USB (udisks2 + polkit + gvfs por DE)
+# ------------------------------------------------------------------------------
+# El montaje real lo hace udisks2 (dbus-activated, no requiere su propio
+# servicio OpenRC). Para que un usuario normal (no root) pueda montar sin
+# contraseña hace falta autorización vía polkit + gestión de sesión vía
+# elogind (Alpine no usa systemd, por eso la variante "elogind" en vez del
+# polkit "puro"). Comandos y nombres de servicio verificados contra la
+# wiki oficial de Alpine (los nombres de servicio OpenRC difieren de los
+# nombres de paquete: "elogind" y "polkit", no "polkit-elogind").
+# Además, cada gestor de archivos necesita su propio "disparador" que
+# reaccione al evento de conexión: gvfs para los basados en GTK
+# (XFCE/GNOME/MATE), gvfs + lxqt-policykit para LXQt. Plasma no necesita
+# nada de esto porque Dolphin usa KIO/Solid + udisks2 directamente.
+setup_usb_automount() {
+    log_info "== Configurando montaje automático de USB =="
+
+    # CRÍTICO: dbus debe estar instalado y habilitado ANTES que udisks2,
+    # elogind y polkit, ya que los tres dependen estrictamente del bus de
+    # mensajes del sistema para funcionar. Se instala aquí explícitamente
+    # en vez de asumir que ya llegó como dependencia transitiva de la DE.
+    install_pkg "dbus"
+    rc-update add dbus default || log_warn "No se pudo agregar 'dbus' al runlevel default."
+
+    install_pkg "udisks2"
+
+    install_pkg "elogind"
+    rc-update add elogind default || log_warn "No se pudo agregar 'elogind' al runlevel default."
+
+    install_pkg "polkit-elogind"
+    rc-update add polkit default || log_warn "No se pudo agregar 'polkit' al runlevel default."
+
+    if [ "$DE_XFCE" = "yes" ]; then
+        install_pkg "gvfs"
+        install_pkg "thunar-volman"
+    fi
+
+    if [ "$DE_GNOME" = "yes" ]; then
+        install_pkg "gvfs"
+    fi
+
+    if [ "$DE_MATE" = "yes" ]; then
+        install_pkg "gvfs"
+    fi
+
+    if [ "$DE_LXQT" = "yes" ]; then
+        install_pkg "gvfs"
+        install_pkg "lxqt-policykit"
+    fi
+
+    if [ "$DE_PLASMA" = "yes" ]; then
+        log_info "Plasma detectado: Dolphin usa KIO/Solid + udisks2 directamente, sin necesidad de gvfs."
+    fi
+
+    log_ok "Montaje automático de USB configurado. Verifica al conectar un USB tras reiniciar."
+}
+
+# ------------------------------------------------------------------------------
+# BLOQUE 14: Soporte de impresión (CUPS)
 # ------------------------------------------------------------------------------
 setup_printing() {
     log_info "== Configurando soporte de impresión (CUPS) =="
@@ -411,7 +476,7 @@ setup_printing() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 14: Backends de compresión
+# BLOQUE 15: Backends de compresión
 # ------------------------------------------------------------------------------
 # NOTA: "unrar" NO existe como paquete en Alpine (ni en main ni en
 # community, verificado en v3.24) - es de licencia no-libre y Alpine no
@@ -429,7 +494,7 @@ install_archive_tools() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 15: Idioma español — sistema, XFCE y propagación global a Plasma
+# BLOQUE 16: Idioma español — sistema, XFCE y propagación global a Plasma
 # ------------------------------------------------------------------------------
 setup_locale_es() {
     log_info "== Configurando idioma español para el sistema =="
@@ -496,7 +561,7 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 16: Tipografías base (antes de LibreOffice)
+# BLOQUE 17: Tipografías base (antes de LibreOffice)
 # ------------------------------------------------------------------------------
 install_fonts() {
     log_info "== Instalando tipografías base =="
@@ -508,7 +573,7 @@ install_fonts() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 17: LibreOffice + paquete de idioma español
+# BLOQUE 18: LibreOffice + paquete de idioma español
 # ------------------------------------------------------------------------------
 install_libreoffice() {
     log_info "== Instalando LibreOffice (español) =="
@@ -518,15 +583,29 @@ install_libreoffice() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 18: Flatpak + Flathub (OnlyOffice y Google Chrome, opcionales)
+# BLOQUE 19: Flatpak + Flathub (OnlyOffice y Google Chrome, opcionales)
 # ------------------------------------------------------------------------------
 setup_flatpak() {
     log_info "== Configurando Flatpak y repositorio Flathub =="
 
-    install_pkg "dbus"
+    # dbus ya se instaló y habilitó en el Bloque 13 (setup_usb_automount).
     install_pkg "flatpak"
     install_pkg "xdg-desktop-portal"
+    # Portal GTK como base universal (XFCE/GNOME/MATE, y red de seguridad
+    # para cualquier entorno). El propio xdg-desktop-portal elige el
+    # backend correcto en tiempo real según XDG_CURRENT_DESKTOP, así que
+    # tener varios instalados es seguro: no hace falta excluir GTK.
     install_pkg "xdg-desktop-portal-gtk"
+
+    if [ "$DE_PLASMA" = "yes" ]; then
+        log_info "Plasma detectado: instalando portal nativo Qt/KDE para diálogos coherentes con el entorno..."
+        install_pkg "xdg-desktop-portal-kde"
+    fi
+
+    if [ "$DE_LXQT" = "yes" ]; then
+        log_info "LXQt detectado: instalando portal nativo Qt/LXQt para diálogos coherentes con el entorno..."
+        install_pkg "xdg-desktop-portal-lxqt"
+    fi
 
     if ! command -v flatpak >/dev/null 2>&1; then
         log_error "flatpak no quedó instalado. Verifica el repositorio 'community'. Se omite esta sección."
@@ -561,7 +640,7 @@ setup_flatpak() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 19: Permisos de grupo para Audio/Video/Impresión
+# BLOQUE 20: Permisos de grupo para Audio/Video/Impresión
 # ------------------------------------------------------------------------------
 setup_user_groups() {
     log_info "== Configurando permisos de grupo =="
@@ -577,7 +656,7 @@ setup_user_groups() {
 }
 
 # ------------------------------------------------------------------------------
-# BLOQUE 20: Función principal
+# BLOQUE 21: Función principal
 # ------------------------------------------------------------------------------
 main() {
     log_info "===== Iniciando configuración post-instalación de escritorio en Alpine Linux ====="
@@ -595,6 +674,7 @@ main() {
     setup_zram
     setup_earlyoom
     setup_power
+    setup_usb_automount
     setup_printing
     install_archive_tools
     setup_locale_es

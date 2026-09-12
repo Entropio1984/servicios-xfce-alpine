@@ -1,8 +1,10 @@
-# xfce-postinstall.sh — Script de post-instalación de escritorio para Alpine Linux
+# desktop-postinstall.sh — Script de post-instalación de escritorio para Alpine Linux
 
 Script de shell POSIX (`ash`, compatible con BusyBox) que automatiza la configuración de un entorno de escritorio recién instalado en Alpine Linux: red, audio, idioma, controladores de video, energía, impresión, ofimática y estabilidad general del sistema. Está pensado especialmente para revivir equipos antiguos o con recursos limitados (2-8 GB de RAM), pero funciona igual de bien en hardware moderno.
 
 Detecta automáticamente qué tiene tu sistema (entorno de escritorio, GPU, CPU) y adapta lo que instala en consecuencia, en vez de asumir una configuración fija.
+
+> ⚠️ **Problema conocido sin resolver — GPU NVIDIA.** En las pruebas realizadas hasta ahora, el modo seguro del Bloque 8 (bloqueo de `nouveau` vía Xorg + `/etc/modprobe.d`) **no ha sido suficiente en todos los casos**: tras reiniciar, el equipo puede seguir mostrando pantalla negra en hardware con tarjeta NVIDIA. Esto sigue bajo investigación y **no debe darse por resuelto** solo por haber respondido "sí" a la pregunta del Bloque 8. Ver la sección [Limitaciones conocidas](#limitaciones-conocidas) para más detalle.
 
 ---
 
@@ -221,6 +223,10 @@ Esto es útil si quieres volver a correrlo tras cambiar de opinión en alguna de
 
 ## Limitaciones conocidas
 
+- **⚠️ Pantalla negra persistente en hardware NVIDIA, incluso con el modo seguro activado.** Pruebas realizadas hasta ahora muestran que, en al menos algunos equipos con tarjeta NVIDIA, el problema de pantalla negra **reaparece tras reiniciar** aunque se haya respondido "sí" a la pregunta del Bloque 8 (bloqueo de `nouveau` vía `NoAccel` en Xorg + `blacklist` en `/etc/modprobe.d`). Esto indica que la causa raíz **no está completamente resuelta** con el enfoque actual — es un pendiente abierto, no una solución garantizada. Si te encuentras en este caso:
+  - No asumas que el equipo quedó "arreglado" solo por haber aceptado el modo seguro; verifica el arranque real tras reiniciar.
+  - Si necesitas recuperar acceso, entra por una TTY (consola de texto, sin arrancar Xorg) para revisar `dmesg | grep -i nouveau` y `cat /var/log/desktop-postinstall.log`, y confirmar si `/etc/modprobe.d/blacklist-nouveau.conf` realmente se aplicó y si el módulo sigue cargado (`lsmod | grep nouveau`).
+  - Si el bloqueo del módulo no fue suficiente, puede que el cuelgue ocurra en una etapa aún más temprana que la cubierta por este script (por ejemplo, en el propio firmware/KMS antes de que OpenRC llegue a iniciar servicios) — este escenario requiere más diagnóstico específico por equipo y todavía no tiene una solución generalizada incorporada al script.
 - **`unrar` no está disponible.** No hay alternativa vía `apk`; ver Bloque 15.
 - **El microcódigo de AMD no se garantiza cargado en el arranque** solo con instalar el paquete; Alpine no lo integra automáticamente al initramfs.
 - **El montaje de USB depende de `elogind` reconociendo la sesión como activa.** Si en algún momento el montaje pide contraseña de root inesperadamente, el problema casi seguro está en que la sesión gráfica no está siendo reconocida como activa por `elogind` — **no** es un problema de pertenencia a grupos Unix (`plugdev`/`storage`), que es el mecanismo de un backend distinto (`seatd`) que este script no usa.
@@ -249,4 +255,4 @@ Esto es útil si quieres volver a correrlo tras cambiar de opinión en alguna de
 
 ---
 
-*Este README documenta el script `xfce-postinstall.sh` tal como quedó tras las correcciones y adiciones acumuladas: distribución latam, detección multi-entorno (XFCE/Plasma/GNOME/MATE/LXQt), soporte de gráficos híbridos, protección NVIDIA legacy, zram, EarlyOOM, gestión de energía, montaje automático de USB, impresión, idioma español en tres capas, tipografías, LibreOffice y Flatpak.*
+*Este README documenta el script `desktop-postinstall.sh` tal como quedó tras las correcciones y adiciones acumuladas: distribución latam, detección multi-entorno (XFCE/Plasma/GNOME/MATE/LXQt), soporte de gráficos híbridos, protección NVIDIA legacy, zram, EarlyOOM, gestión de energía, montaje automático de USB, impresión, idioma español en tres capas, tipografías, LibreOffice y Flatpak.*

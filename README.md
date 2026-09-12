@@ -40,13 +40,13 @@ grep -v '^#' /etc/apk/repositories
 ## Cómo ejecutarlo
 
 ```sh
-doas sh xfce-postinstall.sh
+doas sh desktop-postinstall.sh
 ```
 
 o, si ya estás en una sesión root:
 
 ```sh
-sh xfce-postinstall.sh
+sh desktop-postinstall.sh
 ```
 
 El script pedirá confirmación en un puñado de puntos (ver [sección 5](#preguntas-interactivas-que-hará-el-script)); el resto corre sin intervención. Al finalizar, **reinicia el sistema** — varios cambios (bloqueo de módulos de kernel, servicios recién habilitados, variables de idioma) no toman efecto por completo hasta el próximo arranque.
